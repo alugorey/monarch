@@ -9,11 +9,14 @@
 #ifndef RDMAXCEL_H
 #define RDMAXCEL_H
 
+// Pull in rdma-core / libibverbs headers before CUDA or HIP. Bindgen (and some Clang setups)
+// otherwise see incomplete ibverbs struct declarations first and emit wrong FFI for types such
+// as ibv_qp / ibv_mr / ibv_context (see rust-bindgen#2691).
+#include <infiniband/verbs.h>
+#include <infiniband/mlx5dv.h>
+#include <infiniband/efadv.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <infiniband/efadv.h>
-#include <infiniband/mlx5dv.h>
-#include <infiniband/verbs.h>
 #include "driver_api.h"
 
 // Handle atomics for both C and C++
@@ -23,6 +26,7 @@
 extern "C" {
 #else
 #include <stdatomic.h>
+#include <stdbool.h>
 #endif
 
 typedef enum {

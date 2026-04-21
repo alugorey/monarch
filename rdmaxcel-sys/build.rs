@@ -119,6 +119,9 @@ fn main() {
     // Generate bindings
     let mut builder = bindgen::Builder::default()
         .header(header_path.to_string_lossy())
+        // bindgen < 0.71 mis-parsed several rdma-core structs (ibv_qp, ibv_mr, ibv_context, …)
+        // as empty records with only a 1-byte `_address` placeholder, breaking monarch_rdma field
+        // access. Upgrade bindgen (Cargo.toml) instead of opaque/layout_tests workarounds.
         .clang_arg("-x")
         .clang_arg("c++")
         .clang_arg("-std=c++14")

@@ -13,7 +13,7 @@ serde = { version = "1.0.185", features = ["derive", "rc"] }
 monarch_cpp_static_libs = { path = "../monarch_cpp_static_libs" }
 
 [build-dependencies]
-bindgen = "0.70.1"
+bindgen = "0.72.1"
 cc = "1.0"
 build_utils = { path = "../build_utils" }
 # Need monarch_cpp_static_libs as build-dep to get include paths via DEP_* env vars
