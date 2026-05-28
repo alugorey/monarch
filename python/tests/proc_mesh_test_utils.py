@@ -18,7 +18,7 @@ from monarch.actor import context, ProcMesh
 from monarch.config import configured
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(autouse=False)
 async def stop_all_proc_meshes():
     """Tear down ProcMeshes that the test left attached to the root client.
 
