@@ -256,6 +256,8 @@ impl CudaAllocator {
     pub fn get() -> &'static CudaAllocator {
         CUDA_ALLOCATOR.get_or_init(|| {
             unsafe {
+                // rdmaxcel only adopts an already-loaded driver, so load it first.
+                rdmaxcel_sys::ensure_cuda_driver_loaded();
                 cu_check!(rdmaxcel_sys::rdmaxcel_cuInit(0));
             }
             CudaAllocator {
@@ -415,6 +417,8 @@ impl CudaAllocator {
 #[cfg(test)]
 pub(crate) fn cuda_device_count() -> i32 {
     unsafe {
+        // rdmaxcel only adopts an already-loaded driver, so load it first.
+        rdmaxcel_sys::ensure_cuda_driver_loaded();
         if rdmaxcel_sys::rdmaxcel_cuInit(0) != rdmaxcel_sys::CUDA_SUCCESS {
             return 0;
         }
