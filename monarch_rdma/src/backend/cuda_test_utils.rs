@@ -256,6 +256,8 @@ impl CudaAllocator {
     pub fn get() -> &'static CudaAllocator {
         CUDA_ALLOCATOR.get_or_init(|| {
             unsafe {
+                // rdmaxcel only adopts an already-loaded driver, so load it first.
+                rdmaxcel_sys::ensure_cuda_driver_loaded();
                 cu_check!(rdmaxcel_sys::rdmaxcel_cuInit(0));
             }
             CudaAllocator {
@@ -416,7 +418,18 @@ impl CudaAllocator {
 /// [`crate::backend::ibverbs::device_selection::cuda_device_count`].
 #[cfg(test)]
 pub(crate) fn cuda_device_count() -> i32 {
-    crate::backend::ibverbs::device_selection::cuda_device_count() as i32
+    unsafe {
+        // rdmaxcel only adopts an already-loaded driver, so load it first.
+        rdmaxcel_sys::ensure_cuda_driver_loaded();
+        if rdmaxcel_sys::rdmaxcel_cuInit(0) != rdmaxcel_sys::CUDA_SUCCESS {
+            return 0;
+        }
+        let mut count: i32 = 0;
+        if rdmaxcel_sys::rdmaxcel_cuDeviceGetCount(&mut count) != rdmaxcel_sys::CUDA_SUCCESS {
+            return 0;
+        }
+        count
+    }
 }
 
 /// Segment scanner callback compatible with `rdmaxcel_segment_scanner_fn`.

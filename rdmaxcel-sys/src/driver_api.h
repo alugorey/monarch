@@ -88,6 +88,16 @@ CUresult rdmaxcel_cuPointerGetAttribute(
     CUpointer_attribute attribute,
     CUdeviceptr ptr);
 
+// Driver library loading
+//
+// Ensure the GPU driver library is loaded into the process: tries RTLD_NOLOAD
+// first (adopt an already-loaded library), then falls back to RTLD_LAZY to
+// load it. Call this before rdmaxcel_cuInit from tests/tools that must
+// initialize the driver from scratch; the wrapper functions never load the
+// library themselves -- they only adopt one the owning framework loaded.
+// Returns 0 on success and -1 if the library could not be loaded.
+int ensure_cuda_driver_loaded(void);
+
 // Device management
 CUresult rdmaxcel_cuInit(unsigned int Flags);
 
