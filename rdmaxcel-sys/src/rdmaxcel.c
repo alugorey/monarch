@@ -15,6 +15,15 @@
 #include <time.h>
 #include <unistd.h>
 
+// bnxt_re (Broadcom) exposes no direct-verbs API we call, so unlike mlx5dv and
+// efadv nothing otherwise pulls its provider object into the static link.
+// Referencing the provider symbol forces the linker to retain it; its global
+// constructor then registers the provider with libibverbs. rdmaxcel.h includes
+// <infiniband/verbs.h>, which declares verbs_provider_bnxt_re.
+extern const struct verbs_device_ops verbs_provider_bnxt_re;
+__attribute__((used)) const void* const rdmaxcel_force_bnxt_re =
+    (const void*)&verbs_provider_bnxt_re;
+
 // ============================================================================
 // RDMAXCEL QP Wrapper Implementation
 // ============================================================================

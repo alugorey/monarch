@@ -162,8 +162,12 @@ fn detect_ninja() -> Option<&'static str> {
 fn build_rdma_core(rdma_core_dir: &Path) -> PathBuf {
     let build_dir = rdma_core_dir.join("build");
 
-    // Check if already built
-    if build_dir.join("lib/statics/libibverbs.a").exists() {
+    // Check if already built. Use the bnxt_re provider lib as the sentinel: it
+    // is the last provider added, so its presence implies a complete build (and
+    // a freshly added provider triggers a rebuild instead of being skipped).
+    // Generic providers get the -rdmav<PABI> suffix (here 59, from the pinned
+    // rdma-core commit); only mlx5/efa get the unsuffixed public-lib name.
+    if build_dir.join("lib/statics/libbnxt_re-rdmav59.a").exists() {
         println!("cargo:warning=rdma-core already built");
         return build_dir;
     }
@@ -250,6 +254,7 @@ fn build_rdma_core(rdma_core_dir: &Path) -> PathBuf {
         "lib/statics/libibverbs.a",
         "lib/statics/libmlx5.a",
         "lib/statics/libefa.a",
+        "lib/statics/libbnxt_re-rdmav59.a",
         "util/librdma_util.a",
     ];
 
@@ -331,11 +336,13 @@ fn emit_link_directives(rdma_build_dir: &Path) {
     let libmlx5_path = rdma_static_dir.join("libmlx5.a");
     let libibverbs_path = rdma_static_dir.join("libibverbs.a");
     let libefa_path = rdma_static_dir.join("libefa.a");
+    let libbnxt_re_path = rdma_static_dir.join("libbnxt_re-rdmav59.a");
     let librdma_util_path = rdma_util_dir.join("librdma_util.a");
 
     println!("cargo:rustc-link-arg={}", libmlx5_path.display());
     println!("cargo:rustc-link-arg={}", libibverbs_path.display());
     println!("cargo:rustc-link-arg={}", libefa_path.display());
+    println!("cargo:rustc-link-arg={}", libbnxt_re_path.display());
     println!("cargo:rustc-link-arg={}", librdma_util_path.display());
 
     // Export metadata for dependent crates
@@ -347,10 +354,11 @@ fn emit_link_directives(rdma_build_dir: &Path) {
 
     // Export library paths as a semicolon-separated list
     let lib_paths = format!(
-        "{};{};{};{}",
+        "{};{};{};{};{}",
         libmlx5_path.display(),
         libibverbs_path.display(),
         libefa_path.display(),
+        libbnxt_re_path.display(),
         librdma_util_path.display()
     );
     println!("cargo::metadata=RDMA_STATIC_LIBRARIES={}", lib_paths);

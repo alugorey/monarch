@@ -17,7 +17,7 @@ monarch_cpp_static_libs = { path = "../monarch_cpp_static_libs" }
 # fully-defined records (`ibv_qp`, `ibv_cq`, `completion_cache`, ...) as
 # fieldless opaque blobs against this toolchain's libclang, which breaks field
 # access (e.g. `ibv_qp::qp_num`) and overflows the generated layout assertions.
-bindgen = "0.72"
+bindgen = "0.72.1"
 cc = "1.0"
 build_utils = { path = "../build_utils" }
 # Need monarch_cpp_static_libs as build-dep to get include paths via DEP_* env vars

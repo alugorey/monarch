@@ -396,7 +396,18 @@ impl CppStaticLibsConfig {
     /// different flags (e.g., ENABLE_RESOLVE_NEIGH=1).
     pub fn emit_link_directives(&self) {
         for lib_path in &self.rdma_static_libraries {
-            println!("cargo::rustc-link-arg={}", lib_path);
+            // The bnxt_re (Broadcom) provider exposes no direct-verbs API we
+            // call, so unlike mlx5/efa (pulled in by mlx5dv_*/efadv_* calls)
+            // nothing references its symbols. Without --whole-archive the
+            // linker drops it and its provider constructor never registers the
+            // provider with libibverbs, so its devices never enumerate.
+            if lib_path.contains("libbnxt_re") {
+                println!("cargo::rustc-link-arg=-Wl,--whole-archive");
+                println!("cargo::rustc-link-arg={}", lib_path);
+                println!("cargo::rustc-link-arg=-Wl,--no-whole-archive");
+            } else {
+                println!("cargo::rustc-link-arg={}", lib_path);
+            }
         }
     }
 }
