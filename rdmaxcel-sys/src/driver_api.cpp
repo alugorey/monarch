@@ -44,6 +44,7 @@
 #define SYM_CTX_SET_CURRENT hipCtxSetCurrent
 #define SYM_CTX_SYNCHRONIZE hipCtxSynchronize
 #define SYM_GET_ERROR_STRING hipDrvGetErrorString
+#define SYM_GET_LAST_ERROR hipGetLastError
 #define RDMAXCEL_DRIVER_LIB "libamdhip64.so"
 #else
 #define SYM_MEM_GET_HANDLE_FOR_ADDRESS_RANGE cuMemGetHandleForAddressRange
@@ -118,6 +119,16 @@ struct DriverAPI {
 #define CREATE_MEMBER(name, sym) decltype(&sym) name##_;
   RDMAXCEL_CUDA_DRIVER_API(CREATE_MEMBER)
 #undef CREATE_MEMBER
+#ifdef USE_ROCM
+  // Runtime last-error reset (hipGetLastError). ROCm only: HIP unifies the
+  // driver and runtime APIs behind one per-thread last-error, so a failed
+  // host-pointer hipPointerGetAttribute leaves a sticky hipErrorInvalidValue
+  // that the next consumer would surface. On CUDA this symbol
+  // lives in libcudart, not the dlopened libcuda, and the driver-API probe
+  // does not pollute the runtime last-error, so it is neither needed nor
+  // available there.
+  decltype(&SYM_GET_LAST_ERROR) getLastError_;
+#endif
   static DriverAPI* get();
 };
 
@@ -157,6 +168,16 @@ DriverAPI create_driver_api() {
 
   RDMAXCEL_CUDA_DRIVER_API(LOOKUP_CUDA_ENTRY)
 #undef LOOKUP_CUDA_ENTRY
+
+#ifdef USE_ROCM
+  r.getLastError_ = reinterpret_cast<decltype(&SYM_GET_LAST_ERROR)>(
+      dlsym(handle, STRINGIFY(SYM_GET_LAST_ERROR)));
+  if (!r.getLastError_) {
+    throw std::runtime_error(
+        std::string("[RdmaXcel] Can't find ") + STRINGIFY(SYM_GET_LAST_ERROR) +
+        ": " + dlerror_or("symbol not found"));
+  }
+#endif
 
   return r;
 }
@@ -209,7 +230,6 @@ CUresult ensure_active_context() {
     if (!active) {
       continue;
     }
-
     CUcontext primary = nullptr;
     rc = api->devicePrimaryCtxRetain_(&primary, device);
     if (rc != CUDA_SUCCESS) {
@@ -386,7 +406,27 @@ CUresult rdmaxcel_cuPointerGetAttribute(
     CUpointer_attribute attribute,
     CUdeviceptr ptr) {
   ENSURE_ACTIVE_DRIVER(api);
-  return api->pointerGetAttribute_(data, attribute, ptr);
+  CUresult rc = api->pointerGetAttribute_(data, attribute, ptr);
+#ifdef USE_ROCM
+  // On ROCm the driver and runtime APIs share a single per-thread last-error.
+  // Probing a host pointer fails with hipErrorInvalidValue and leaves it
+  // sticky; the next consumer would read it
+  // and fail spuriously. Consume it here, at the call site -- not in a
+  // higher-level wrapper -- so the probe has no observable effect on global
+  // error state. `rc` already carries the result the caller needs.
+  //
+  // Reset only when the probe itself failed. A successful HIP call does not
+  // touch the last-error, so an unconditional reset could swallow an
+  // unrelated error left by an earlier call; gating on `rc` guarantees we
+  // consume only the error this probe produced. (A failing probe overwrites
+  // any prior error with its own, so nothing extra is lost here.) On CUDA,
+  // cuPointerGetAttribute does not touch the runtime last-error, so no reset
+  // is needed (and cudaGetLastError is not in the dlopened driver library).
+  if (rc != CUDA_SUCCESS) {
+    api->getLastError_();
+  }
+#endif
+  return rc;
 }
 
 // Driver library loading
