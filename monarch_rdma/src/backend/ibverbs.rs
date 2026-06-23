@@ -14,6 +14,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use typeuri::Named;
 
+pub mod broadcom_device;
+pub mod broadcom_domain;
 pub mod device;
 pub mod device_selection;
 pub(crate) mod domain;

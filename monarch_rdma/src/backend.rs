@@ -26,6 +26,7 @@ use typeuri::Named;
 
 use crate::RdmaOp;
 use crate::RdmaTransportLevel;
+use crate::backend::ibverbs::broadcom_device::BroadcomDevice;
 use crate::backend::ibverbs::efa_device::EfaDevice;
 use crate::backend::ibverbs::manager_actor::IbvBackend;
 use crate::backend::ibverbs::mlx_device::MlxDevice;
@@ -303,5 +304,6 @@ macro_rules! register_rdma_backends {
 register_rdma_backends! {
     Mlx: IbvBackend<MlxDevice>,
     Efa: IbvBackend<EfaDevice>,
+    Broadcom: IbvBackend<BroadcomDevice>,
     Tcp: TcpBackend,
 }
