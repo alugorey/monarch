@@ -47,6 +47,7 @@ use typeuri::Named;
 
 use super::IbvBuffer;
 use super::IbvOp;
+use super::broadcom_device::BroadcomDevice;
 use super::device::IbvDevice;
 use super::device::IbvDeviceImpl;
 use super::device_selection::resolve_target;
@@ -95,6 +96,7 @@ pub(super) struct CreatePeerQueuePair<M: Referable> {
 }
 wirevalue::register_type!(CreatePeerQueuePair<IbvManagerActor<MlxDevice>>);
 wirevalue::register_type!(CreatePeerQueuePair<IbvManagerActor<EfaDevice>>);
+wirevalue::register_type!(CreatePeerQueuePair<IbvManagerActor<BroadcomDevice>>);
 
 /// Local-only message: submit a batch of RDMA ops for end-to-end
 /// execution. The manager iterates the batch, resolves each op's
@@ -1000,6 +1002,15 @@ impl ResolveIbv<EfaDevice> for NicRemoteBackendContext {
     fn resolve(&self) -> Option<(ActorRef<IbvManagerActor<EfaDevice>>, IbvBuffer)> {
         match self {
             NicRemoteBackendContext::Efa(mgr, buf) => Some((mgr.clone(), buf.clone())),
+            _ => None,
+        }
+    }
+}
+
+impl ResolveIbv<BroadcomDevice> for NicRemoteBackendContext {
+    fn resolve(&self) -> Option<(ActorRef<IbvManagerActor<BroadcomDevice>>, IbvBuffer)> {
+        match self {
+            NicRemoteBackendContext::Broadcom(mgr, buf) => Some((mgr.clone(), buf.clone())),
             _ => None,
         }
     }

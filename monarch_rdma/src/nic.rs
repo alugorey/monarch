@@ -22,6 +22,7 @@ use typeuri::Named;
 use crate::RdmaOp;
 use crate::backend::RdmaBackend;
 use crate::backend::ibverbs::IbvBuffer;
+use crate::backend::ibverbs::broadcom_device::BroadcomDevice;
 use crate::backend::ibverbs::device::IbvDevice;
 use crate::backend::ibverbs::efa_device::EfaDevice;
 use crate::backend::ibverbs::manager_actor::IbvBackend;
@@ -38,6 +39,7 @@ use crate::local_memory::KeepaliveLocalMemory;
 pub enum NicRemoteBackendContext {
     Mlx(ActorRef<IbvManagerActor<MlxDevice>>, IbvBuffer),
     Efa(ActorRef<IbvManagerActor<EfaDevice>>, IbvBuffer),
+    Broadcom(ActorRef<IbvManagerActor<BroadcomDevice>>, IbvBuffer),
 }
 wirevalue::register_type!(NicRemoteBackendContext);
 
@@ -48,6 +50,7 @@ impl NicRemoteBackendContext {
             (self, handle),
             (NicRemoteBackendContext::Mlx(..), NicBackendHandle::Mlx(_))
                 | (NicRemoteBackendContext::Efa(..), NicBackendHandle::Efa(_))
+                | (NicRemoteBackendContext::Broadcom(..), NicBackendHandle::Broadcom(_))
         )
     }
 }
@@ -57,6 +60,7 @@ impl NicRemoteBackendContext {
 pub enum NicBackendHandle {
     Mlx(IbvBackend<MlxDevice>),
     Efa(IbvBackend<EfaDevice>),
+    Broadcom(IbvBackend<BroadcomDevice>),
 }
 
 impl NicBackendHandle {
@@ -79,6 +83,13 @@ impl NicBackendHandle {
         if IbvDevice::<EfaDevice>::available() {
             let actor = IbvManagerActor::<EfaDevice>::new(params).await?;
             return Ok(Some(NicBackendHandle::Efa(IbvBackend(this.spawn(actor)))));
+        }
+        // FLAG (backend priority): like mlx/efa above, Broadcom is selected
+        // by first-available. A host with multiple distinct RDMA NIC vendors
+        // present would need an explicit selection policy, not this fixed order.
+        if IbvDevice::<BroadcomDevice>::available() {
+            let actor = IbvManagerActor::<BroadcomDevice>::new(params).await?;
+            return Ok(Some(NicBackendHandle::Broadcom(IbvBackend(this.spawn(actor)))));
         }
         tracing::warn!("no RDMA NIC devices found");
         Ok(None)
@@ -106,6 +117,13 @@ impl NicBackendHandle {
                     .map_err(|e| anyhow::anyhow!(e))?;
                 Ok(NicRemoteBackendContext::Efa(backend.bind(), buf))
             }
+            NicBackendHandle::Broadcom(backend) => {
+                let buf = backend
+                    .register_remote_buffer(cx, remote_buf_id, local)
+                    .await?
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                Ok(NicRemoteBackendContext::Broadcom(backend.bind(), buf))
+            }
         }
     }
 
@@ -118,6 +136,9 @@ impl NicBackendHandle {
         match self {
             NicBackendHandle::Mlx(backend) => backend.release_buffer(cx, remote_buf_id).await,
             NicBackendHandle::Efa(backend) => backend.release_buffer(cx, remote_buf_id).await,
+            NicBackendHandle::Broadcom(backend) => {
+                backend.release_buffer(cx, remote_buf_id).await
+            }
         }
     }
 
@@ -131,6 +152,9 @@ impl NicBackendHandle {
         match self {
             NicBackendHandle::Mlx(backend) => backend.clone().submit(cx, ops, timeout).await,
             NicBackendHandle::Efa(backend) => backend.clone().submit(cx, ops, timeout).await,
+            NicBackendHandle::Broadcom(backend) => {
+                backend.clone().submit(cx, ops, timeout).await
+            }
         }
     }
 }
