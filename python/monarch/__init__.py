@@ -9,6 +9,14 @@
 from importlib import import_module as _import_module
 from typing import TYPE_CHECKING
 
+
+# Pre-emptively pre-load torch if environment requires it
+if os.environ.get("MONARCH_PRELOAD_TORCH", "0") == "1":
+  try:
+    import torch
+  except ImportError:
+    pass
+
 # Import before monarch to pre-load torch DSOs as, in exploded wheel flows,
 # our RPATHs won't correctly find them.
 try:
