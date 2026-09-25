@@ -32,6 +32,8 @@ use crate::backend::ibverbs::manager_actor::IbvBackend;
 use crate::backend::ibverbs::mlx_device::MlxDevice;
 use crate::backend::ibverbs::primitives::IbvConfig;
 use crate::backend::tcp::manager_actor::TcpBackend;
+use crate::device_selection::MemoryLocation;
+use crate::device_selection::PciPath;
 use crate::local_memory::KeepaliveLocalMemory;
 use crate::rdma_components::RdmaRemoteBuffer;
 
@@ -68,6 +70,14 @@ pub trait RdmaBackend: Clone + Debug + Send + Sync + 'static {
     /// operations (e.g. from a GPU kernel).
     fn transport_info(&self) -> Option<Self::TransportInfo>;
 
+    /// The PCIe path from memory at `location` to the NIC this backend would
+    /// serve it from. [`RdmaBackends::register_all`] compares these to pick
+    /// between backends when a host has more than one. `None`, the default,
+    /// means the backend is not ranked by locality and always serves.
+    fn path_to(&self, _location: MemoryLocation) -> Option<PciPath> {
+        None
+    }
+
     /// Spawn the backend's actor(s) as children of `cx` and return its handle.
     async fn spawn(cx: &(impl context::Actor + Send + Sync), config: &RdmaConfig) -> Result<Self>
     where
@@ -103,6 +113,29 @@ pub(crate) trait ResolveRemoteBackendContext<B: RdmaBackend> {
     fn resolve(&self) -> Option<B::RemoteBackendContext>;
 }
 
+/// Which backends should serve a buffer, given each one's
+/// [`RdmaBackend::path_to`] the buffer (in registration order).
+///
+/// An unranked backend (`None`) always serves. A ranked backend serves unless
+/// another ranked backend has a strictly better path, so a host with several
+/// NIC backends serves each buffer from the NICs closest to it rather than
+/// from whichever backend is listed first, and tied backends all serve. With
+/// at most one ranked backend, every backend serves.
+fn serving_backends(paths: &[Option<PciPath>]) -> Vec<bool> {
+    let best = paths
+        .iter()
+        .flatten()
+        .copied()
+        .reduce(|a, b| if b.is_better_than(&a) { b } else { a });
+    paths
+        .iter()
+        .map(|path| match (path, &best) {
+            (Some(path), Some(best)) => !best.is_better_than(path),
+            _ => true,
+        })
+        .collect()
+}
+
 /// Derives the per-process RDMA backend registry from a list of
 /// `Variant: Handle` pairs, where each `Handle` implements
 /// [`RdmaBackend`].
@@ -111,7 +144,9 @@ pub(crate) trait ResolveRemoteBackendContext<B: RdmaBackend> {
 /// wire contexts) with its [`ResolveRemoteBackendContext`] impls and
 /// `RdmaRemoteBuffer::resolve_<name>` accessors, [`RdmaBackendHandle`]
 /// and its `submit` dispatch, and [`RdmaBackends`] (the proc's spawned
-/// backends). The list order is the routing priority.
+/// backends). The list order is the routing priority among the backends a
+/// buffer advertises; which NIC backends advertise it is decided by locality
+/// (see [`serving_backends`]).
 macro_rules! register_rdma_backends {
     ($($variant:ident: $handle:ty),+ $(,)?) => {
         paste::paste! {
@@ -205,18 +240,36 @@ macro_rules! register_rdma_backends {
                     handles
                 }
 
-                /// Register `local` with every spawned backend. On the first
-                /// failure, release the backends that already registered and
-                /// return that error.
+                /// Register `local` with every spawned backend that should
+                /// serve it: those [`serving_backends`] keeps, so on a host
+                /// with several NIC backends only the ones with the best path
+                /// to `local` advertise it. On the first failure, release the
+                /// backends that already registered and return that error.
                 pub(crate) async fn register_all(
                     &self,
                     cx: &(impl context::Actor + Send + Sync),
                     remote_buf_id: usize,
                     local: KeepaliveLocalMemory,
                 ) -> Result<RdmaRemoteBackends> {
+                    let location = local.location();
+                    let paths = [$(
+                        self.[<$variant:lower>]
+                            .as_ref()
+                            .and_then(|handle| <$handle as RdmaBackend>::path_to(handle, location)),
+                    )+];
+                    let mut serving = serving_backends(&paths).into_iter();
                     let mut remotes = RdmaRemoteBackends::default();
                     $(
-                        if let Some(handle) = &self.[<$variant:lower>] {
+                        let serves = serving.next().expect("one entry per backend");
+                        if self.[<$variant:lower>].is_some() && !serves {
+                            tracing::debug!(
+                                "not registering {location:?} memory on {}: another backend has a closer NIC",
+                                stringify!($variant),
+                            );
+                        }
+                        if let Some(handle) = &self.[<$variant:lower>]
+                            && serves
+                        {
                             match <$handle as RdmaBackend>::register_remote_buffer(
                                 handle,
                                 cx,
@@ -359,6 +412,92 @@ mod tests {
     use crate::RdmaManagerActor;
     use crate::RdmaManagerMessageClient;
     use crate::backend::ibverbs::device::IbvDevice;
+    use crate::backend::ibverbs::device_selection::IbvDeviceTarget;
+    use crate::backend::ibverbs::device_selection::best_ibv_path;
+    use crate::backend::ibverbs::device_selection::get_pci_address;
+    use crate::backend::ibverbs::device_selection::select_optimal_ibv_devices;
+    use crate::backend::ibverbs::primitives::IbvDeviceInfo;
+    use crate::device_selection::PathType;
+
+    fn path(path_type: PathType, bottleneck_mbytes_per_sec: u32) -> Option<PciPath> {
+        Some(PciPath {
+            path_type,
+            bottleneck_mbytes_per_sec,
+        })
+    }
+
+    #[test]
+    fn a_lone_nic_backend_always_serves() {
+        // Mlx-only or EFA-only hosts: one ranked backend plus TCP. Whatever its
+        // path, it serves, so these hosts register exactly as before.
+        for only in [
+            path(PathType::Pix, 50_000),
+            path(PathType::Sys, 1),
+            path(PathType::Dis, 0),
+        ] {
+            assert_eq!(serving_backends(&[only, None, None, None]), [true; 4]);
+            assert_eq!(serving_backends(&[None, only, None, None]), [true; 4]);
+        }
+        assert_eq!(serving_backends(&[None, None, None, None]), [true; 4]);
+    }
+
+    #[test]
+    fn a_more_local_nic_backend_wins() {
+        // [Mlx, Efa, Ionic, Tcp] for GPU memory on NUMA node 1 of a host whose
+        // only mlx5 NIC is on node 0: the ionic NIC shares the GPU's node.
+        assert_eq!(
+            serving_backends(&[
+                path(PathType::Sys, 25_000),
+                None,
+                path(PathType::Phb, 50_000),
+                None,
+            ]),
+            [false, true, true, true],
+        );
+        // Locality beats bandwidth.
+        assert_eq!(
+            serving_backends(&[
+                path(PathType::Pix, 1),
+                None,
+                path(PathType::Phb, 50_000),
+                None
+            ]),
+            [true, true, false, true],
+        );
+    }
+
+    #[test]
+    fn equally_local_nic_backends_rank_by_bandwidth_and_tie() {
+        // Same NUMA node: the 400 Gb/s ionic NIC beats the 200 Gb/s mlx5 one.
+        assert_eq!(
+            serving_backends(&[
+                path(PathType::Phb, 25_000),
+                None,
+                path(PathType::Phb, 50_000),
+                None,
+            ]),
+            [false, true, true, true],
+        );
+        // A full tie keeps both, so list order breaks it as it did before.
+        assert_eq!(
+            serving_backends(&[
+                path(PathType::Phb, 50_000),
+                None,
+                path(PathType::Phb, 50_000),
+                None,
+            ]),
+            [true; 4],
+        );
+    }
+
+    #[test]
+    fn a_nic_backend_with_no_nic_for_the_buffer_yields() {
+        // `nic:ionic_3` pins the manager to one ionic NIC; Mlx has no such NIC.
+        assert_eq!(
+            serving_backends(&[path(PathType::Dis, 0), None, path(PathType::Sys, 1), None]),
+            [false, true, true, true],
+        );
+    }
 
     /// On a host with ionic NICs, the backends an [`RdmaManagerActor`] spawns
     /// (through [`RdmaBackends::spawn_available`]) include Ionic. Skips when no
@@ -392,5 +531,82 @@ mod tests {
         proc.destroy_and_wait(Duration::from_secs(10), "test done")
             .await
             .expect("destroy proc");
+    }
+
+    /// The NIC backends' paths to `location` in registration order
+    /// `[Mlx, Efa, Ionic, Tcp]`, as [`RdmaBackends::register_all`] sees them
+    /// for a manager with device target `target`.
+    fn nic_paths(
+        location: MemoryLocation,
+        target: Option<&IbvDeviceTarget>,
+    ) -> [Option<PciPath>; 4] {
+        [
+            best_ibv_path::<MlxDevice>(location, target).ok(),
+            best_ibv_path::<EfaDevice>(location, target).ok(),
+            best_ibv_path::<IonicDevice>(location, target).ok(),
+            None,
+        ]
+    }
+
+    /// On a host with ionic NICs, using real sysfs topology (host memory, so
+    /// no GPU driver is needed): host memory on a NUMA node is served by the
+    /// ionic NICs on that node, and a manager pinned to one NIC is served by
+    /// that NIC's backend alone. Prints what each backend offers. Skips without
+    /// ionic NICs.
+    #[test]
+    fn nic_backend_choice_on_this_host() {
+        let ionic = IbvDevice::<IonicDevice>::list();
+        if ionic.is_empty() {
+            eprintln!("no ionic devices on this host; skipping");
+            return;
+        }
+        let numa_of = |nic: &IbvDeviceInfo| {
+            let addr = get_pci_address(nic).expect("NIC has a PCI address");
+            std::fs::read_to_string(addr.sysfs_path().join("numa_node"))
+                .expect("read numa_node")
+                .trim()
+                .to_string()
+        };
+        let mut numas: Vec<String> = ionic.iter().map(numa_of).collect();
+        numas.sort();
+        numas.dedup();
+
+        let mut locations = vec![MemoryLocation::Cpu(None)];
+        locations.extend(
+            numas
+                .iter()
+                .filter_map(|numa| numa.parse().ok())
+                .map(|numa| MemoryLocation::Cpu(Some(numa))),
+        );
+        for location in locations {
+            let paths = nic_paths(location, None);
+            let serving = serving_backends(&paths);
+            let chosen =
+                select_optimal_ibv_devices::<IonicDevice>(location).expect("rank ionic NICs");
+            println!(
+                "{location:?}: mlx {:?} ionic {:?} serving [Mlx, Efa, Ionic, Tcp] = {serving:?} ionic NICs {:?}",
+                paths[0],
+                paths[2],
+                chosen.iter().map(|nic| nic.name()).collect::<Vec<_>>(),
+            );
+            if let MemoryLocation::Cpu(Some(numa)) = location {
+                for nic in &chosen {
+                    assert_eq!(numa_of(nic), numa.to_string(), "{} is off node", nic.name());
+                }
+            }
+        }
+
+        // A manager pinned to an ionic NIC is served by Ionic alone, and one
+        // pinned to another backend's NIC is not served by Ionic.
+        let pinned = IbvDeviceTarget::nic(ionic[0].name().clone());
+        let serving = serving_backends(&nic_paths(MemoryLocation::Cpu(None), Some(&pinned)));
+        println!("pinned to {pinned:?}: serving {serving:?}");
+        assert_eq!(serving, [false, false, true, true]);
+        if let Some(mlx) = IbvDevice::<MlxDevice>::list().first() {
+            let pinned = IbvDeviceTarget::nic(mlx.name().clone());
+            let serving = serving_backends(&nic_paths(MemoryLocation::Cpu(None), Some(&pinned)));
+            println!("pinned to {pinned:?}: serving {serving:?}");
+            assert_eq!(serving, [true, false, false, true]);
+        }
     }
 }
