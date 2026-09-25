@@ -27,6 +27,7 @@ use typeuri::Named;
 use crate::RdmaOp;
 use crate::RdmaTransportLevel;
 use crate::backend::ibverbs::efa_device::EfaDevice;
+use crate::backend::ibverbs::ionic_device::IonicDevice;
 use crate::backend::ibverbs::manager_actor::IbvBackend;
 use crate::backend::ibverbs::mlx_device::MlxDevice;
 use crate::backend::ibverbs::primitives::IbvConfig;
@@ -342,5 +343,54 @@ macro_rules! register_rdma_backends {
 register_rdma_backends! {
     Mlx: IbvBackend<MlxDevice>,
     Efa: IbvBackend<EfaDevice>,
+    Ionic: IbvBackend<IonicDevice>,
     Tcp: TcpBackend,
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperactor::ActorEnvironment;
+    use hyperactor::Proc;
+    use hyperactor::RemoteSpawn;
+    use hyperactor::channel::ChannelAddr;
+    use hyperactor::channel::ChannelTransport;
+
+    use super::*;
+    use crate::RdmaManagerActor;
+    use crate::RdmaManagerMessageClient;
+    use crate::backend::ibverbs::device::IbvDevice;
+
+    /// On a host with ionic NICs, the backends an [`RdmaManagerActor`] spawns
+    /// (through [`RdmaBackends::spawn_available`]) include Ionic. Skips when no
+    /// ionic device is present.
+    #[timed_test::async_timed_test(timeout_secs = 60)]
+    async fn spawn_available_includes_ionic_when_present() {
+        if IbvDevice::<IonicDevice>::list().is_empty() {
+            eprintln!("no ionic devices on this host; skipping");
+            return;
+        }
+        let mut proc = Proc::direct(
+            ChannelAddr::any(ChannelTransport::Unix),
+            "spawn_available_ionic".to_string(),
+        )
+        .expect("create proc");
+        let client = proc.client("test_client");
+        let rdma_actor = RdmaManagerActor::new(None, &ActorEnvironment::default())
+            .await
+            .expect("create RdmaManagerActor");
+        let rdma_handle = proc.spawn(rdma_actor);
+        let names: Vec<&str> = rdma_handle
+            .get_backend_handles(&client)
+            .await
+            .expect("get backend handles")
+            .iter()
+            .map(|handle| handle.backend_name())
+            .collect();
+        println!("spawned RDMA backends, in priority order: {names:?}");
+        assert!(names.contains(&"Ionic"), "Ionic not spawned: {names:?}");
+
+        proc.destroy_and_wait(Duration::from_secs(10), "test done")
+            .await
+            .expect("destroy proc");
+    }
 }
