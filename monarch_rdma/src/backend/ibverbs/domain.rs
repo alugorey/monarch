@@ -388,6 +388,109 @@ pub(super) unsafe fn register_dmabuf_range(
     Ok(unsafe { IbvMr::from_raw(mr, pd.clone()) })
 }
 
+/// One physical VMM mapping registered as its own dmabuf MR. `offset` is the
+/// mapping's start relative to the base of the range passed to
+/// [`register_dmabuf_mr_per_mapping`]; `size` is its byte length.
+pub(super) struct MappingMr {
+    pub(super) mr: IbvMr,
+    pub(super) offset: usize,
+    pub(super) size: usize,
+}
+
+/// Register `[base, base + total)` as one dmabuf MR **per physical VMM mapping**.
+///
+/// `hipMemGetHandleForAddressRange` exports a dmabuf covering only the first
+/// physical mapping of a multi-mapping range (by design: the kernel forbids one
+/// dmabuf spanning multiple backing buffers). This walks the range one mapping at
+/// a time: export at the current boundary, measure the (truncated) dmabuf with
+/// `lseek` to learn the mapping's size, register exactly that mapping, advance.
+/// Single-mapping memory (plain `hipMalloc`) yields one MR.
+///
+/// `base` must be host-page aligned (callers widen to the allocation base, which
+/// is granularity-aligned); mapping sizes are granularity-aligned, so every
+/// subsequent boundary stays aligned.
+///
+/// # Safety
+///
+/// `pd` must be null or a live PD whose context outlives the returned MRs;
+/// `[base, base + total)` must name live CUDA device memory valid for their
+/// lifetime.
+pub(super) unsafe fn register_dmabuf_mr_per_mapping(
+    pd: &Arc<IbvPd>,
+    base: usize,
+    total: usize,
+    access_flags: i32,
+) -> anyhow::Result<Vec<MappingMr>> {
+    if pd.as_ptr().is_null() {
+        anyhow::bail!("register_dmabuf_mr_per_mapping called with a null protection domain");
+    }
+    anyhow::ensure!(
+        total > 0,
+        "register_dmabuf_mr_per_mapping called with a zero-size range (base: 0x{base:x})"
+    );
+    let end = base
+        .checked_add(total)
+        .with_context(|| format!("range [0x{base:x}, +{total}) overflows usize"))?;
+
+    let mut mrs: Vec<MappingMr> = Vec::new();
+    let mut cur = base;
+    while cur < end {
+        let remaining = end - cur;
+
+        // Export a dmabuf at `cur`. On multi-mapping memory HIP truncates this to
+        // the single physical mapping that starts at `cur`.
+        let mut fd: i32 = -1;
+        // SAFETY: writes only `&mut fd`; `cur` is passed by value as an opaque
+        // device address; failure is reported via the return code, checked next.
+        let cu_err = unsafe {
+            rdmaxcel_sys::rdmaxcel_cuMemGetHandleForAddressRange(
+                &mut fd,
+                cur as rdmaxcel_sys::CUdeviceptr,
+                remaining,
+                rdmaxcel_sys::CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+                0,
+            )
+        };
+        if cu_err != rdmaxcel_sys::CUDA_SUCCESS || fd < 0 {
+            anyhow::bail!(
+                "failed to export dmabuf for mapping at 0x{cur:x} (remaining: {remaining}, cu_err: {cu_err}, fd: {fd})"
+            );
+        }
+        // SAFETY: `fd >= 0` is a dmabuf descriptor we own; `OwnedFd` closes it on
+        // drop and keeps it open across the registration below.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        // Measure what the kernel actually exported: this one mapping's size.
+        // SAFETY: `fd` is a live descriptor; `lseek` takes no pointers.
+        let mapped = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) };
+        if mapped <= 0 {
+            anyhow::bail!(
+                "could not measure dmabuf size for mapping at 0x{cur:x} (lseek returned {mapped})"
+            );
+        }
+        // A mapping never extends past the range we asked for.
+        let mapped = (mapped as usize).min(remaining);
+
+        // Register exactly this mapping.
+        // SAFETY: `pd` is a live PD (checked above); `fd` is a live dmabuf kept
+        // open across the call; `mapped` matches the exported dmabuf.
+        let mr = unsafe {
+            rdmaxcel_sys::ibv_reg_dmabuf_mr(pd.as_ptr(), 0, mapped, 0, fd.as_raw_fd(), access_flags)
+        };
+        if mr.is_null() {
+            anyhow::bail!("failed to register dmabuf MR for mapping at 0x{cur:x} (size: {mapped})");
+        }
+        // SAFETY: `mr` is non-null and freshly registered against `pd`.
+        mrs.push(MappingMr {
+            mr: unsafe { IbvMr::from_raw(mr, pd.clone()) },
+            offset: cur - base,
+            size: mapped,
+        });
+        cur += mapped;
+    }
+    Ok(mrs)
+}
+
 /// Base address and size of the CUDA allocation containing `addr`, as reported
 /// by `cuMemGetAddressRange`.
 ///
@@ -587,6 +690,50 @@ mod tests {
             .expect("domain creation should succeed")
     }
 
+    /// Open an [`IbvDomain`] on the first NIC that can register GPU memory on
+    /// CUDA device 0 via dmabuf, ignoring NIC/GPU affinity ranking.
+    ///
+    /// Unlike [`open_domain_for_cuda_device`], this does NOT require an ACTIVE
+    /// fabric port: `ibv_reg_dmabuf_mr` binds GPU memory to the HCA over PCIe
+    /// peer-to-peer, which is independent of link state, so these registration
+    /// tests run even on a host whose fabric is down (every port `PORT_DOWN`),
+    /// where affinity selection -- which drops any NIC with no ACTIVE port --
+    /// would exclude every NIC. The probe (a committed GPU allocation that this
+    /// NIC must be able to register) also skips NICs with no p2p path to the GPU.
+    /// Panics if no NIC can register GPU memory, which means this host cannot run
+    /// GPU-Direct dmabuf tests at all.
+    fn open_gpu_capable_domain() -> IbvDomain<MlxDomain> {
+        assert!(
+            cuda_device_count() > 0,
+            "a CUDA device is required by this test",
+        );
+        let probe = CudaAllocator::get().allocate(0, 2 * 1024 * 1024, 2 * 1024 * 1024);
+        let mut config = IbvConfig::default();
+        MlxDevice::apply_config_defaults(&mut config);
+        for nic in IbvDevice::<MlxDevice>::list() {
+            let name = nic.name().clone();
+            let Ok(dev) = IbvDevice::<MlxDevice>::try_open(&name, config.clone()) else {
+                continue;
+            };
+            // SAFETY: `dev.context()` wraps the live `ibv_context` just opened;
+            // the `Arc<IbvContext>` keeps it open for this domain's lifetime.
+            let domain =
+                match unsafe { IbvDomain::new(dev.context(), dev.device_info().clone(), &config) } {
+                    Ok(domain) => domain,
+                    Err(_) => continue,
+                };
+            // SAFETY: `domain.pd()` is a live PD; `probe` is a live committed GPU
+            // allocation kept mapped for the duration of this call. The MR drops
+            // at the end of this `if let`, before the next iteration.
+            if let Ok((_mr, _offset)) = unsafe {
+                register_dmabuf_mr(domain.pd(), probe.ptr(), probe.size(), domain.access_flags())
+            } {
+                return domain;
+            }
+        }
+        panic!("no NIC can register GPU memory via dmabuf on this host");
+    }
+
     /// A 4 MiB allocation, fully committed (reserved == committed) so it is
     /// entirely mapped and `cuMemGetAddressRange` reports the whole extent.
     fn committed_allocation() -> crate::backend::cuda_test_utils::CudaAllocation {
@@ -688,6 +835,42 @@ mod tests {
             3 * g,
             "MR covers the three spanned mappings in full, not the fourth"
         );
+    }
+
+    // `register_dmabuf_mr_per_mapping` registers a multi-mapping allocation as one
+    // dmabuf MR per physical mapping, which is the ROCm-correct path:
+    // `hipMemGetHandleForAddressRange` truncates a multi-mapping export to the
+    // first mapping, so `register_dmabuf_mr` (above) cannot cover the whole range.
+    #[test]
+    fn register_dmabuf_mr_per_mapping_covers_every_mapping() {
+        let domain = open_gpu_capable_domain();
+        let pd = domain.pd();
+        let access = domain.access_flags();
+
+        // Four separate mappings of one granularity each.
+        let alloc = CudaAllocator::get().allocate(0, 128 * 1024 * 1024, 1);
+        let g = alloc.granularity();
+        for _ in 0..3 {
+            alloc
+                .expand(g)
+                .expect("expand stays within the reserved range");
+        }
+        assert_eq!(alloc.size(), 4 * g, "four mappings of one granularity each");
+
+        // SAFETY: `pd` is a live PD; `alloc` keeps all four mappings resident for
+        // the MRs' lifetime (it outlives `mrs`, which drop first).
+        let mrs =
+            unsafe { register_dmabuf_mr_per_mapping(pd, alloc.ptr(), 4 * g, access) }.unwrap();
+
+        assert_eq!(mrs.len(), 4, "one MR per physical mapping");
+        for (i, m) in mrs.iter().enumerate() {
+            assert_eq!(m.offset, i * g, "mapping {i} starts at offset {i}*g");
+            assert_eq!(m.size, g, "mapping {i} is one granularity");
+            // SAFETY: `m.mr` owns a live MR and has not been dropped.
+            let (iova, length) = unsafe { mr_extent(m.mr.as_ptr()) };
+            assert_eq!(iova, 0, "each dmabuf MR is mapped at iova 0");
+            assert_eq!(length, g, "each MR covers exactly its mapping");
+        }
     }
 
     // `register_dmabuf_range` registers exactly the requested range — a strict
