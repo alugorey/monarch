@@ -22,7 +22,10 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
+use super::memory_region::IbvMemoryRegionKeepalive;
 use super::memory_region::IbvMemoryRegionView;
+use super::memory_region::MrSegment;
+use super::memory_region::SegmentedMrs;
 use super::primitives::IbvConfig;
 use super::primitives::IbvContext;
 use super::primitives::IbvCq;
@@ -521,6 +524,34 @@ fn cuda_alloc_range(addr: usize) -> anyhow::Result<(usize, usize)> {
     Ok((base as usize, size))
 }
 
+/// The widened span `[base, end)` a dmabuf registration of `[addr, addr + size)`
+/// must cover: from the base of the allocation holding `addr` to the end of the
+/// allocation holding the range's last byte. A range may run past the allocation
+/// its first byte falls in, so `cuMemGetAddressRange` is queried at both ends.
+/// Allocation bounds are granularity- (hence host-page-) aligned.
+///
+/// Must be called with `addr`'s CUDA context current (it queries
+/// `cuMemGetAddressRange`; see [`crate::local_memory::set_ctx_for_ptr`]).
+fn cuda_alloc_span(addr: usize, size: usize) -> anyhow::Result<(usize, usize)> {
+    anyhow::ensure!(
+        size > 0,
+        "cuda_alloc_span called with a zero-size range (addr: 0x{addr:x})"
+    );
+    let (base, base_size) = cuda_alloc_range(addr)?;
+    let last = addr.checked_add(size - 1).with_context(|| {
+        format!("final byte of range [{addr}, {addr} + {size}) would overflow max usize")
+    })?;
+    // When the range lies within the first allocation, that allocation is the
+    // end; otherwise a second lookup resolves the allocation the last byte is in.
+    let end = if last - base < base_size {
+        base + base_size
+    } else {
+        let (last_base, last_size) = cuda_alloc_range(last)?;
+        last_base + last_size
+    };
+    Ok((base, end))
+}
+
 /// Register the CUDA device memory backing `[addr, addr + size)` as a single
 /// dmabuf MR, mapped at iova 0. The returned `usize` is the offset of `addr`
 /// within that MR.
@@ -561,22 +592,7 @@ pub(super) unsafe fn register_dmabuf_mr(
     // restores the prior context on drop.
     let _ctx_guard = unsafe { crate::local_memory::set_ctx_for_ptr(addr)? };
 
-    let (base, base_size) = cuda_alloc_range(addr)?;
-    let last = addr.checked_add(size - 1).with_context(|| {
-        format!(
-            "final byte of range [{}, {} + {}) would overflow max usize",
-            addr, addr, size
-        )
-    })?;
-    // Extend to the end of the allocation holding the range's last byte. When
-    // the range lies within the first allocation, that allocation is the end;
-    // otherwise a second lookup resolves the allocation the last byte falls in.
-    let end = if last - base < base_size {
-        base + base_size
-    } else {
-        let (last_base, last_size) = cuda_alloc_range(last)?;
-        last_base + last_size
-    };
+    let (base, end) = cuda_alloc_span(addr, size)?;
 
     // SAFETY: forwards this function's contract; `register_dmabuf_range` checks
     // that `base` and `end - base` are host-page aligned.
@@ -584,10 +600,117 @@ pub(super) unsafe fn register_dmabuf_mr(
     Ok((mr, addr - base))
 }
 
+/// Register the CUDA device memory backing `[addr, addr + size)` as one dmabuf
+/// MR **per physical mapping**, returning a view of the requested sub-range.
+///
+/// This is the fallback [`register_host_or_dmabuf_mr`] takes when the single-MR
+/// [`register_dmabuf_mr`] cannot register multi-mapping memory (ROCm
+/// `expandable_segments` / vLLM cumem), whose whole-range dmabuf export
+/// truncates to the first mapping. It widens to the enclosing allocation (one
+/// dmabuf export must start at a mapping boundary, which the sub-range's start
+/// need not be), registers each physical mapping, and narrows the result back to
+/// `[addr, addr + size)`.
+///
+/// Returns `Ok(None)` when the allocation is single-mapping (one MR): there is
+/// then no multi-mapping to stitch, and the caller should surface the original
+/// single-MR error. Otherwise `Ok(Some(view))` — segmented across the mappings
+/// the sub-range spans, or collapsed to the flat form when it lies within one.
+///
+/// # Safety
+///
+/// As [`register_dmabuf_mr`]: `pd` null or live, `[addr, addr + size)` live CUDA
+/// device memory valid for the returned view's MRs' lifetime.
+unsafe fn register_dmabuf_segmented_mr(
+    pd: &Arc<IbvPd>,
+    addr: usize,
+    size: usize,
+    access_flags: i32,
+    device_name: &str,
+) -> anyhow::Result<Option<IbvMemoryRegionView>> {
+    anyhow::ensure!(
+        size > 0,
+        "register_dmabuf_segmented_mr called with a zero-size range (addr: 0x{addr:x})"
+    );
+    // SAFETY: device memory only (the `Gpu` arm of `register_host_or_dmabuf_mr`),
+    // so `addr` is a valid CUDA device pointer; the guard restores the prior
+    // context on drop.
+    let _ctx_guard = unsafe { crate::local_memory::set_ctx_for_ptr(addr)? };
+    let (base, end) = cuda_alloc_span(addr, size)?;
+
+    // SAFETY: forwards this function's contract; the per-mapping registrar checks
+    // PD validity and that `base` is host-page aligned (allocation bases are).
+    let mappings =
+        unsafe { register_dmabuf_mr_per_mapping(pd, base, end - base, access_flags)? };
+    // One mapping is not the multi-mapping case this path exists for; signal the
+    // caller to keep its original single-MR error.
+    if mappings.len() <= 1 {
+        return Ok(None);
+    }
+
+    let mut segments = Vec::with_capacity(mappings.len());
+    let mut mrs = Vec::with_capacity(mappings.len());
+    for mapping in mappings {
+        // SAFETY: `mapping.mr` wraps a non-null, freshly-registered MR at iova 0.
+        let (rdma_addr, lkey, rkey) = unsafe {
+            let p = mapping.mr.as_ptr();
+            ((*p).addr as usize, (*p).lkey, (*p).rkey)
+        };
+        segments.push(MrSegment {
+            offset: mapping.offset,
+            size: mapping.size,
+            rdma_addr,
+            lkey,
+            rkey,
+        });
+        mrs.push(mapping.mr);
+    }
+    // One guard owns every per-mapping MR (each deregistered on its `Drop`) and
+    // anchors their PD past deregistration.
+    let guard: Arc<dyn IbvMemoryRegionKeepalive> = Arc::new(SegmentedMrs(mrs));
+    // The view over the whole allocation, narrowed to the requested sub-range:
+    // `try_slice` keeps only the mappings `[addr, addr + size)` spans and
+    // collapses to the flat form when that is a single mapping.
+    let whole = IbvMemoryRegionView::new_segmented(
+        base,
+        end - base,
+        device_name.to_string(),
+        segments,
+        guard,
+    );
+    Ok(Some(whole.try_slice(addr - base, size)?))
+}
+
+/// Build a flat (single-MR) view of `[addr, addr + size)` from a freshly
+/// registered `mr` whose iova-0 address space places the requested range at
+/// `mr_offset`.
+fn flat_region_view(
+    mr: IbvMr,
+    mr_offset: usize,
+    addr: usize,
+    size: usize,
+    device_name: String,
+) -> IbvMemoryRegionView {
+    // SAFETY: `mr` wraps a non-null, freshly-registered `ibv_mr`, so reading its
+    // `addr`/`lkey`/`rkey` is sound.
+    let (mr_addr, lkey, rkey) = unsafe {
+        let p = mr.as_ptr();
+        ((*p).addr as usize, (*p).lkey, (*p).rkey)
+    };
+    // The view addresses the requested sub-range, which sits at `mr_offset`
+    // within the MR's zero-based address space.
+    let rdma_addr = mr_addr + mr_offset;
+    // The `IbvMr` guard owns the MR (deregistered on its `Drop`) and anchors the
+    // PD past that deregistration; it coerces to `Arc<dyn IbvMemoryRegionKeepalive>`.
+    let guard = Arc::new(mr);
+    IbvMemoryRegionView::new(addr, rdma_addr, size, lkey, rkey, device_name, guard)
+}
+
 /// Default MR registration: host memory via [`register_host_mr`], device
-/// memory via [`register_dmabuf_mr`]. Shared by the [`IbvDomainImpl`]
-/// default `register_mr` and by backends as the fallback for memory they
-/// do not special-case.
+/// memory via [`register_dmabuf_mr`], falling back to per-mapping registration
+/// ([`register_dmabuf_segmented_mr`]) for multi-mapping device memory the
+/// single-MR path cannot handle. Shared by the [`IbvDomainImpl`] default
+/// `register_mr` and by backends as the fallback for memory they do not
+/// special-case.
 ///
 /// # Safety
 ///
@@ -603,43 +726,47 @@ pub(super) unsafe fn register_host_or_dmabuf_mr<I: IbvDomainImpl>(
     let addr = mem.addr();
     let size = mem.size();
     let access_flags = domain.access_flags();
-    // `mr_offset` is the offset of `addr` within the MR. For device memory the
-    // MR covers every allocation the range spans, so the requested range may start
-    // partway in; for host memory the MR is the requested range itself, so the
-    // offset is 0.
-    // SAFETY: per this function's contract `domain.as_ptr()` is null or a live
-    // PD (the helpers error on null), and `[addr, addr + size)` stays valid for
-    // the returned MR's lifetime.
-    let (mr, mr_offset) = unsafe {
-        match mem.location() {
-            MemoryLocation::Gpu(_) => register_dmabuf_mr(domain.pd(), addr, size, access_flags)?,
-            MemoryLocation::Cpu(_) => (register_host_mr(domain.pd(), addr, size, access_flags)?, 0),
-        }
-    };
-
-    // SAFETY: `mr` wraps a non-null, freshly-registered `ibv_mr` —
-    // `register_dmabuf_mr`/`register_host_mr` only return `Ok` with one — so
-    // reading its `addr`/`lkey`/`rkey` here is sound.
-    let (mr_addr, lkey, rkey) = unsafe {
-        let p = mr.as_ptr();
-        ((*p).addr as usize, (*p).lkey, (*p).rkey)
-    };
-    // The view addresses the requested sub-range, which sits at `mr_offset`
-    // within the MR's zero-based address space.
-    let rdma_addr = mr_addr + mr_offset;
     let device_name = domain.device_info().name().to_string();
-    // The `IbvMr` guard owns the MR (deregistered on its `Drop`) and anchors the
-    // PD past that deregistration; it coerces to `Arc<dyn IbvMemoryRegionKeepalive>`.
-    let guard = Arc::new(mr);
-    Ok(IbvMemoryRegionView::new(
-        addr,
-        rdma_addr,
-        size,
-        lkey,
-        rkey,
-        device_name,
-        guard,
-    ))
+    // SAFETY: per this function's contract `domain.pd()` is null or a live PD
+    // (the helpers error on null), and `[addr, addr + size)` stays valid for the
+    // returned view's MR lifetime.
+    match mem.location() {
+        // Host memory registers as itself: the MR is the requested range, so the
+        // requested address sits at offset 0 within it.
+        MemoryLocation::Cpu(_) => {
+            let mr = unsafe { register_host_mr(domain.pd(), addr, size, access_flags)? };
+            Ok(flat_region_view(mr, 0, addr, size, device_name))
+        }
+        // Device memory registers as a single dmabuf MR over the whole enclosing
+        // allocation (the requested range may start partway in). That is the only
+        // path on CUDA and on single-mapping ROCm memory.
+        MemoryLocation::Gpu(_) => {
+            match unsafe { register_dmabuf_mr(domain.pd(), addr, size, access_flags) } {
+                Ok((mr, mr_offset)) => {
+                    Ok(flat_region_view(mr, mr_offset, addr, size, device_name))
+                }
+                // The whole-range export truncates on multi-mapping ROCm memory
+                // (`expandable_segments` / vLLM cumem), so that registration
+                // fails. Register each physical mapping instead and stitch them in
+                // software. Only genuinely multi-mapping memory takes this path;
+                // for anything else the original error is the real one.
+                Err(flat_err) => {
+                    match unsafe {
+                        register_dmabuf_segmented_mr(
+                            domain.pd(),
+                            addr,
+                            size,
+                            access_flags,
+                            &device_name,
+                        )
+                    } {
+                        Ok(Some(view)) => Ok(view),
+                        Ok(None) | Err(_) => Err(flat_err),
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -879,6 +1006,107 @@ mod tests {
             assert_eq!(iova, 0, "each dmabuf MR is mapped at iova 0");
             assert_eq!(length, g, "each MR covers exactly its mapping");
         }
+    }
+
+    /// A reserved region grown to `n` separate mappings of one granularity each,
+    /// returning the allocation and the granularity `g`.
+    fn n_mapping_allocation(n: usize) -> (crate::backend::cuda_test_utils::CudaAllocation, usize) {
+        let alloc = CudaAllocator::get().allocate(0, 128 * 1024 * 1024, 1);
+        let g = alloc.granularity();
+        for _ in 1..n {
+            alloc
+                .expand(g)
+                .expect("expand stays within the reserved range");
+        }
+        assert_eq!(alloc.size(), n * g, "{n} mappings of one granularity each");
+        (alloc, g)
+    }
+
+    // `register_dmabuf_segmented_mr` registers a request that spans several
+    // physical mappings as one MR per mapping and returns a segmented view tiling
+    // the request, each segment's MR at iova 0.
+    #[test]
+    fn segmented_mr_splits_a_request_spanning_several_mappings() {
+        let domain = open_gpu_capable_domain();
+        let device = domain.device_info().name().to_string();
+        let (alloc, g) = n_mapping_allocation(4);
+
+        // SAFETY: live PD; `alloc` keeps every mapping resident for the view's MRs
+        // (it outlives `view`, which drops first).
+        let view = unsafe {
+            register_dmabuf_segmented_mr(
+                domain.pd(),
+                alloc.ptr(),
+                4 * g,
+                domain.access_flags(),
+                &device,
+            )
+        }
+        .unwrap()
+        .expect("a request spanning four mappings yields a segmented view");
+
+        assert!(view.is_segmented(), "four mappings -> segmented");
+        assert_eq!(view.size, 4 * g);
+        assert_eq!(view.virtual_addr, alloc.ptr());
+        let segs = view.segments().expect("segmented");
+        assert_eq!(segs.len(), 4, "one segment per mapping");
+        for (i, s) in segs.iter().enumerate() {
+            assert_eq!(s.offset, i * g, "segment {i} at offset {i}*g");
+            assert_eq!(s.size, g, "segment {i} is one granularity");
+            assert_eq!(s.rdma_addr, 0, "each per-mapping MR is at iova 0");
+        }
+    }
+
+    // A request confined to a single mapping is not the multi-mapping case, so the
+    // segmented path declines (`None`) and the caller keeps its single-MR result.
+    #[test]
+    fn segmented_mr_returns_none_for_a_single_mapping_request() {
+        let domain = open_gpu_capable_domain();
+        let device = domain.device_info().name().to_string();
+        let (alloc, g) = n_mapping_allocation(4);
+
+        // One granularity starting at the base: a single mapping.
+        // SAFETY: as above.
+        let result = unsafe {
+            register_dmabuf_segmented_mr(domain.pd(), alloc.ptr(), g, domain.access_flags(), &device)
+        }
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "a single-mapping request declines the segmented path"
+        );
+    }
+
+    // A request spanning an interior subset of the mappings widens only to the
+    // mappings it touches: the view is segmented over exactly those, rebased so it
+    // begins at the request's start.
+    #[test]
+    fn segmented_mr_covers_only_the_mappings_a_request_spans() {
+        let domain = open_gpu_capable_domain();
+        let device = domain.device_info().name().to_string();
+        let (alloc, g) = n_mapping_allocation(4);
+
+        // The middle two mappings: [ptr + g, ptr + 3g).
+        // SAFETY: as above.
+        let view = unsafe {
+            register_dmabuf_segmented_mr(
+                domain.pd(),
+                alloc.ptr() + g,
+                2 * g,
+                domain.access_flags(),
+                &device,
+            )
+        }
+        .unwrap()
+        .expect("a request spanning two mappings yields a segmented view");
+
+        assert!(view.is_segmented(), "two mappings -> segmented");
+        assert_eq!(view.virtual_addr, alloc.ptr() + g);
+        assert_eq!(view.size, 2 * g);
+        let segs = view.segments().expect("segmented");
+        assert_eq!(segs.len(), 2, "only the two spanned mappings");
+        assert_eq!((segs[0].offset, segs[0].size), (0, g));
+        assert_eq!((segs[1].offset, segs[1].size), (g, g));
     }
 
     // `register_dmabuf_range` registers exactly the requested range — a strict

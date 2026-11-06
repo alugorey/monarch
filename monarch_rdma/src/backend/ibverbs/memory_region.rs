@@ -43,7 +43,9 @@ impl IbvMemoryRegionKeepalive for IbvMr {}
 /// multi-mapping [`IbvMemoryRegionView`], so the whole set stays registered
 /// until the last view clone drops.
 #[derive(Debug)]
-pub(super) struct SegmentedMrs(pub(super) Vec<IbvMr>);
+// The MRs are held only so their `Drop` deregisters them; the field is never
+// read, which dead-code analysis cannot see through `Drop`.
+pub(super) struct SegmentedMrs(#[allow(dead_code)] pub(super) Vec<IbvMr>);
 impl IbvMemoryRegionKeepalive for SegmentedMrs {}
 
 /// One physical mapping within a segmented registration.
@@ -161,6 +163,8 @@ impl IbvMemoryRegionView {
 
     /// Whether this region is registered as more than one physical mapping, so a
     /// transfer crossing a mapping boundary must be split along [`Self::segments`].
+    // Used by tests and by the step-5 transfer path; not yet read elsewhere.
+    #[allow(dead_code)]
     pub(super) fn is_segmented(&self) -> bool {
         self.segments.is_some()
     }
