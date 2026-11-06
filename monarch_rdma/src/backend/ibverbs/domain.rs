@@ -702,6 +702,14 @@ mod tests {
     /// NIC must be able to register) also skips NICs with no p2p path to the GPU.
     /// Panics if no NIC can register GPU memory, which means this host cannot run
     /// GPU-Direct dmabuf tests at all.
+    ///
+    /// TODO(ionic): this fixture is mlx5-only (`MlxDevice`/`MlxDomain`), so it
+    /// does NOT exercise the ionic provider and is NOT valid for ionic
+    /// validation. The primitives under test take a raw `pd` and are
+    /// backend-agnostic; verifying per-mapping registration on a real ionic NIC
+    /// means generifying this over the backend (or adding an ionic variant).
+    /// mlx5-green proves the enumeration/data-model logic, not ionic provider
+    /// acceptance or the ionic transfer path (owner-side WRITE / Option A).
     fn open_gpu_capable_domain() -> IbvDomain<MlxDomain> {
         assert!(
             cuda_device_count() > 0,

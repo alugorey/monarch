@@ -245,6 +245,19 @@ impl IbvMemoryRegionView {
     }
 }
 
+/// One physical mapping of a peer's segmented registration, as the wire carries
+/// it: the wire form of an [`MrSegment`], without the local-only `lkey`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteMrSegment {
+    /// Byte offset of this mapping from the region base.
+    pub offset: usize,
+    /// Length of this mapping in bytes.
+    pub size: usize,
+    /// RDMA address of this mapping's MR; the peer targets this segment here.
+    pub addr: usize,
+    pub rkey: u32,
+}
+
 /// What a peer needs in order to address one of our registered memory regions
 /// over RDMA: the region's `rkey`, its RDMA address, its size, and the device
 /// serving it.
@@ -253,6 +266,12 @@ impl IbvMemoryRegionView {
 /// no keepalive: an `lkey` only means anything to the protection domain that
 /// issued it, and the registration is kept alive by the views the owning side
 /// holds.
+///
+/// A multi-mapping region (ROCm `expandable_segments` / vLLM cumem, registered
+/// one MR per physical mapping) carries its per-mapping `segments`; a transfer
+/// crossing a mapping boundary must be split along them. `None` is the common
+/// single-MR case, where `rkey`/`addr` address the whole region on their own and
+/// the field is omitted from the wire entirely.
 #[derive(Debug, Clone, Serialize, Deserialize, Named)]
 pub struct IbvRemoteMemoryRegionView {
     pub rkey: u32,
@@ -261,11 +280,44 @@ pub struct IbvRemoteMemoryRegionView {
     pub size: usize,
     /// Name of the RDMA device this region is registered on (e.g., "mlx5_0").
     pub device_name: String,
+    /// Per-mapping segments for a multi-mapping region, in ascending `offset`
+    /// order, tiling `[0, size)`; `None` for the single-MR fast path. For a
+    /// segmented region `rkey`/`addr` mirror `segments[0]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<RemoteMrSegment>>,
 }
 
 impl IbvRemoteMemoryRegionView {
+    /// Builds a remote view over `segments` separate per-mapping MRs. `segments`
+    /// must be in ascending `offset` order and tile `[0, total_size)` with no
+    /// gaps or overlaps. A single-segment list collapses to the flat form, so a
+    /// segmented remote view is always genuinely multi-mapping.
+    fn from_segments(total_size: usize, device_name: String, segments: Vec<RemoteMrSegment>) -> Self {
+        debug_assert!(
+            !segments.is_empty()
+                && segments.first().map(|s| s.offset) == Some(0)
+                && segments
+                    .windows(2)
+                    .all(|w| w[0].offset + w[0].size == w[1].offset)
+                && segments.last().map(|s| s.offset + s.size) == Some(total_size),
+            "segments must tile [0, {total_size}) in order with no gaps",
+        );
+        let first = &segments[0];
+        let (rkey, addr) = (first.rkey, first.addr);
+        let segments = (segments.len() > 1).then_some(segments);
+        Self {
+            rkey,
+            addr,
+            size: total_size,
+            device_name,
+            segments,
+        }
+    }
+
     /// Returns a view of `size` bytes starting at `offset` in the peer's region.
-    /// The slice retains the remote key and device.
+    /// The slice retains the remote key(s) and device. For a segmented region it
+    /// keeps only the mappings it overlaps, each trimmed and rebased to the slice
+    /// origin; a slice landing within a single mapping collapses to the flat form.
     pub fn try_slice(&self, offset: usize, size: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(
             offset.checked_add(size).is_some_and(|end| end <= self.size),
@@ -276,23 +328,63 @@ impl IbvRemoteMemoryRegionView {
             self.addr + self.size,
             self.device_name,
         );
-        Ok(Self {
-            addr: self.addr + offset,
-            size,
-            ..self.clone()
-        })
+        // Single-MR fast path, and the degenerate zero-byte slice: shift the
+        // address, keep the key. For a segmented view the flat `addr` mirrors
+        // `segments[0]`, so a zero-byte view's address is nominal.
+        if self.segments.is_none() || size == 0 {
+            return Ok(Self {
+                addr: self.addr + offset,
+                size,
+                segments: None,
+                ..self.clone()
+            });
+        }
+        let (start, end) = (offset, offset + size);
+        let sliced: Vec<RemoteMrSegment> = self
+            .segments
+            .as_ref()
+            .expect("segmented in this arm")
+            .iter()
+            .filter_map(|seg| {
+                let (lo, hi) = (seg.offset.max(start), (seg.offset + seg.size).min(end));
+                (lo < hi).then(|| RemoteMrSegment {
+                    offset: lo - start,
+                    size: hi - lo,
+                    addr: seg.addr + (lo - seg.offset),
+                    rkey: seg.rkey,
+                })
+            })
+            .collect();
+        Ok(Self::from_segments(size, self.device_name.clone(), sliced))
     }
 }
 
 impl From<&IbvMemoryRegionView> for IbvRemoteMemoryRegionView {
-    /// The wire transport details are fully derived from the registered MR
-    /// view: the remote key, the RDMA address, the size, and the device name.
+    /// The wire transport details are fully derived from the registered MR view:
+    /// the remote key(s), the RDMA address(es), the size, and the device name.
+    /// A segmented local view carries its per-mapping MRs over as segments.
     fn from(view: &IbvMemoryRegionView) -> Self {
-        Self {
-            rkey: view.rkey,
-            addr: view.rdma_addr,
-            size: view.size,
-            device_name: view.device_name.clone(),
+        match view.segments() {
+            None => Self {
+                rkey: view.rkey,
+                addr: view.rdma_addr,
+                size: view.size,
+                device_name: view.device_name.clone(),
+                segments: None,
+            },
+            Some(segments) => Self::from_segments(
+                view.size,
+                view.device_name.clone(),
+                segments
+                    .iter()
+                    .map(|seg| RemoteMrSegment {
+                        offset: seg.offset,
+                        size: seg.size,
+                        addr: seg.rdma_addr,
+                        rkey: seg.rkey,
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -455,5 +547,57 @@ mod tests {
         let zero = v.try_slice(0x3000, 0).expect("empty slice at the end");
         assert!(!zero.is_segmented(), "a zero-byte slice carries no segment table");
         assert_eq!(zero.size, 0);
+    }
+
+    #[test]
+    fn remote_from_a_segmented_local_view_carries_every_mapping() {
+        let remote = IbvRemoteMemoryRegionView::from(&segmented_view());
+        assert_eq!(remote.size, 0x3000);
+        // Flat fields mirror segment 0 (no lkey/virtual_addr on the wire form).
+        assert_eq!((remote.rkey, remote.addr), (11, 0xA000));
+        let segs = remote.segments.as_ref().expect("segmented on the wire");
+        assert_eq!(segs.len(), 3);
+        assert_eq!((segs[0].offset, segs[0].size, segs[0].addr, segs[0].rkey), (0x0, 0x1000, 0xA000, 11));
+        assert_eq!((segs[1].offset, segs[1].size, segs[1].addr, segs[1].rkey), (0x1000, 0x1000, 0xB000, 12));
+        assert_eq!((segs[2].offset, segs[2].size, segs[2].addr, segs[2].rkey), (0x2000, 0x1000, 0xC000, 13));
+    }
+
+    #[test]
+    fn remote_from_a_single_mr_view_has_no_segment_table() {
+        // The common single-MR view produces no segments, so the wire form is
+        // byte-for-byte what it was before segmentation existed.
+        let remote = IbvRemoteMemoryRegionView::from(&view(0x4000, 4096));
+        assert!(remote.segments.is_none());
+        assert_eq!((remote.rkey, remote.addr, remote.size), (0x5678, 0x4000, 4096));
+    }
+
+    #[test]
+    fn a_remote_slice_crossing_mappings_keeps_each_trimmed() {
+        let remote = IbvRemoteMemoryRegionView::from(&segmented_view());
+        // [0x800, 0x2800): last half of seg 0, all of seg 1, first half of seg 2.
+        let sliced = remote.try_slice(0x800, 0x2000).expect("spans three mappings");
+        let segs = sliced.segments.as_ref().expect("still segmented");
+        assert_eq!(segs.len(), 3);
+        assert_eq!((segs[0].offset, segs[0].size, segs[0].addr, segs[0].rkey), (0x0, 0x800, 0xA800, 11));
+        assert_eq!((segs[1].offset, segs[1].size, segs[1].addr, segs[1].rkey), (0x800, 0x1000, 0xB000, 12));
+        assert_eq!((segs[2].offset, segs[2].size, segs[2].addr, segs[2].rkey), (0x1800, 0x800, 0xC000, 13));
+        assert_eq!((sliced.rkey, sliced.addr, sliced.size), (11, 0xA800, 0x2000));
+    }
+
+    #[test]
+    fn a_remote_slice_within_one_mapping_collapses_to_flat() {
+        let remote = IbvRemoteMemoryRegionView::from(&segmented_view());
+        // [0x1800, 0x1A00) is entirely in segment 1 (RDMA base 0xB000), 0x800 in.
+        let sliced = remote.try_slice(0x1800, 0x200).expect("inside segment 1");
+        assert!(sliced.segments.is_none(), "a single-mapping slice is flat");
+        assert_eq!((sliced.rkey, sliced.addr, sliced.size), (12, 0xB800, 0x200));
+    }
+
+    #[test]
+    fn remote_segmented_slices_are_bounded() {
+        let remote = IbvRemoteMemoryRegionView::from(&segmented_view());
+        assert!(remote.try_slice(0, 0x3000).is_ok());
+        assert!(remote.try_slice(0x3000, 1).is_err());
+        assert!(remote.try_slice(0x2800, 0x1000).is_err());
     }
 }

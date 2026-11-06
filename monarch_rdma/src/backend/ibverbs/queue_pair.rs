@@ -2158,6 +2158,7 @@ mod tests {
             addr: 0x4000_0000,
             size: region_size,
             device_name: PEER_DEVICE.to_string(),
+            segments: None,
         }
         .try_slice(offset, size)
         .expect("a valid remote slice");

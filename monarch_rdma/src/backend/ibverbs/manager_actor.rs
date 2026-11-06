@@ -2076,6 +2076,7 @@ mod tests {
                 addr: 0x1000,
                 size,
                 device_name: device,
+                segments: None,
             });
         }
         let remote_manager = ActorRef::attest(
